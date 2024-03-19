@@ -27,14 +27,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	telemetryv1 "github.com/openstack-k8s-operators/telemetry-operator/api/v1beta1"
 )
 
-// KSMDeployment requests Deployment of kube-state-metrics
+// KSMStatefulSet requests seployment of kube-state-metrics and creation of TLS config if it is necessary
 func KSMStatefulSet(
 	instance *telemetryv1.Ceilometer,
 	labels map[string]string,
-) (*appsv1.StatefulSet, error) {
+) (*appsv1.StatefulSet, *corev1.Secret, error) {
 
 	livenessProbe := &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
@@ -70,6 +71,54 @@ func KSMStatefulSet(
 		},
 	}
 
+	labels["app.kubernetes.io/component"] = "exporter"
+	labels["app.kubernetes.io/name"] = KSMServiceName
+	labels["app.kubernetes.io/version"] = instance.Spec.KSMImage[strings.LastIndex(instance.Spec.KSMImage, ":")+1:]
+
+	sec := &corev1.Secret{}
+	volumes := []corev1.Volume{}
+	mounts := []corev1.VolumeMount{}
+	if instance.Spec.KSMTLS.Enabled() {
+		svc, err := instance.Spec.KSMTLS.GenericService.ToService()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		certPath := fmt.Sprintf("/etc/pki/tls/certs/%s", tls.CertKey)
+		keyPath := fmt.Sprintf("/etc/pki/tls/private/%s", tls.PrivateKey)
+
+		svc.CertMount = ptr.To(certPath)
+		svc.KeyMount = ptr.To(keyPath)
+
+		livenessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+		readinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+
+		sec := KSMTLSConfig(instance, labels, certPath, keyPath)
+		volumes = append(volumes, svc.CreateVolume(KSMServiceName), corev1.Volume{
+			Name: fmt.Sprintf("%s-tls-config", KSMServiceName),
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  sec.Name,
+					DefaultMode: ptr.To[int32](0400),
+				},
+			},
+		})
+		mounts = svc.CreateVolumeMounts(KSMServiceName)
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      fmt.Sprintf("%s-tls-config", KSMServiceName),
+			MountPath: tlsConfPath,
+			SubPath:   tlsConfKey,
+			ReadOnly:  true,
+		})
+	}
+
+	// add CA cert if defined
+	if instance.Spec.KSMTLS.CaBundleSecretName != "" {
+		ca := instance.Spec.KSMTLS.Ca
+		volumes = append(volumes, ca.CreateVolume())
+		mounts = append(mounts, ca.CreateVolumeMounts(nil)...)
+	}
+
 	container := corev1.Container{
 		ImagePullPolicy: corev1.PullAlways,
 		Image:           instance.Spec.KSMImage,
@@ -91,11 +140,8 @@ func KSMStatefulSet(
 				Name:          "telemetry",
 			},
 		},
+		VolumeMounts: mounts,
 	}
-
-	labels["app.kubernetes.io/component"] = "exporter"
-	labels["app.kubernetes.io/name"] = KSMServiceName
-	labels["app.kubernetes.io/version"] = instance.Spec.KSMImage[strings.LastIndex(instance.Spec.KSMImage, ":")+1:]
 
 	ss := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -118,10 +164,11 @@ func KSMStatefulSet(
 					AutomountServiceAccountToken: ptr.To(true),
 					ServiceAccountName:           KSMServiceName,
 					Containers:                   []corev1.Container{container},
+					Volumes:                      volumes,
 				},
 			},
 		},
 	}
 
-	return ss, nil
+	return ss, sec, nil
 }
