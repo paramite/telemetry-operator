@@ -230,6 +230,8 @@ const (
 	ceilometerPasswordSecretField     = ".spec.secret"
 	ceilometerCaBundleSecretNameField = ".spec.tls.caBundleSecretName"
 	ceilometerTlsField                = ".spec.tls.secretName"
+	ksmCaBundleSecretNameField        = ".spec.ksmTls.caBundleSecretName"
+	ksmTlsField                       = ".spec.ksmTls.secretName"
 )
 
 var (
@@ -237,6 +239,8 @@ var (
 		ceilometerPasswordSecretField,
 		ceilometerCaBundleSecretNameField,
 		ceilometerTlsField,
+		ksmCaBundleSecretNameField,
+		ksmTlsField,
 	}
 )
 
@@ -327,21 +331,28 @@ func (r *CeilometerReconciler) reconcileInit(
 }
 
 func (r *CeilometerReconciler) reconcileNormal(ctx context.Context, instance *telemetryv1.Ceilometer, helper *helper.Helper) (ctrl.Result, error) {
+	// ConfigMap
+	configMapVars := make(map[string]env.Setter)
 
-	ceilRes, err := r.reconcileCeilometer(ctx, instance, helper)
-	if err != nil {
-		return ceilRes, err
-	}
-
-	ksmRes, err := r.reconcileKSM(ctx, instance, helper)
+	ksmRes, err := r.reconcileKSM(ctx, instance, helper, &configMapVars)
 	if err != nil {
 		return ksmRes, err
+	}
+
+	ceilRes, err := r.reconcileCeilometer(ctx, instance, helper, &configMapVars)
+	if err != nil {
+		return ceilRes, err
 	}
 
 	return ceilRes, nil
 }
 
-func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance *telemetryv1.Ceilometer, helper *helper.Helper) (ctrl.Result, error) {
+func (r *CeilometerReconciler) reconcileCeilometer(
+	ctx context.Context,
+	instance *telemetryv1.Ceilometer,
+	helper *helper.Helper,
+	configMapVars *map[string]env.Setter,
+) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Reconciling Service '%s'", ceilometer.ServiceName))
 
@@ -400,13 +411,10 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 	instance.CeilometerStatus.Conditions.MarkTrue(condition.RabbitMqTransportURLReadyCondition, condition.RabbitMqTransportURLReadyMessage)
 	// end transportURL
 
-	// ConfigMap
-	configMapVars := make(map[string]env.Setter)
-
 	//
 	// check for required OpenStack secret holding passwords for service/admin user and add hash to the vars map
 	//
-	ctrlResult, err := r.getSecret(ctx, helper, instance, instance.Spec.Secret, &configMapVars)
+	ctrlResult, err := r.getSecret(ctx, helper, instance, instance.Spec.Secret, configMapVars)
 	if err != nil {
 		return ctrlResult, err
 	}
@@ -415,7 +423,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 	//
 	// check for required TransportURL secret holding transport URL string
 	//
-	ctrlResult, err = r.getSecret(ctx, helper, instance, instance.CeilometerStatus.TransportURLSecret, &configMapVars)
+	ctrlResult, err = r.getSecret(ctx, helper, instance, instance.CeilometerStatus.TransportURLSecret, configMapVars)
 	if err != nil {
 		return ctrlResult, err
 	}
@@ -449,7 +457,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 		}
 
 		if hash != "" {
-			configMapVars[tls.CABundleKey] = env.SetValue(hash)
+			(*configMapVars)[tls.CABundleKey] = env.SetValue(hash)
 		}
 	}
 
@@ -467,7 +475,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 		} else if (ctrlResult != ctrl.Result{}) {
 			return ctrlResult, nil
 		}
-		configMapVars[tls.TLSHashName] = env.SetValue(hash)
+		(*configMapVars)[tls.TLSHashName] = env.SetValue(hash)
 	}
 	// all cert input checks out so report InputReady
 	instance.CeilometerStatus.Conditions.MarkTrue(condition.TLSInputReadyCondition, condition.InputReadyMessage)
@@ -478,7 +486,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 	// - %-config configmap holding minimal ceilometer config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars)
+	err = r.generateServiceConfig(ctx, helper, instance, configMapVars)
 	if err != nil {
 		instance.CeilometerStatus.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -495,7 +503,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 	// - %-config configmap holding minimal ceilometer-compute config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateComputeServiceConfig(ctx, helper, instance, &configMapVars)
+	err = r.generateComputeServiceConfig(ctx, helper, instance, configMapVars)
 	if err != nil {
 		instance.CeilometerStatus.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -510,7 +518,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(ctx context.Context, instance
 	// create hash over all the different input resources to identify if any those changed
 	// and a restart/recreate is required.
 	//
-	inputHash, hashChanged, err := r.createHashOfInputHashes(ctx, instance, configMapVars)
+	inputHash, hashChanged, err := r.createHashOfInputHashes(ctx, instance, *configMapVars)
 	if err != nil {
 		instance.CeilometerStatus.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -594,12 +602,13 @@ func (r *CeilometerReconciler) reconcileKSM(
 	ctx context.Context,
 	instance *telemetryv1.Ceilometer,
 	helper *helper.Helper,
+	configMapVars *map[string]env.Setter,
 ) (ctrl.Result, error) {
 	Log := r.GetLogger(ctx)
 	Log.Info(fmt.Sprintf("Reconciling Service '%s'", availability.KSMServiceName))
 
 	// create service account and role binding for the KSM service
-	sa, rb, err := availability.KSMServiceAccount(instance)
+	sa, rb := availability.KSMServiceAccount(instance)
 
 	svcacc := serviceaccount.NewServiceAccount(sa, time.Duration(5)*time.Second)
 	ctrlResult, err := svcacc.CreateOrPatch(ctx, helper)
@@ -649,17 +658,76 @@ func (r *CeilometerReconciler) reconcileKSM(
 		return ctrl.Result{}, err
 	}
 
-	// create the service
 	serviceLabels := map[string]string{
 		common.AppSelector: availability.KSMServiceName,
 	}
 
-	ssDef, err := availability.KSMStatefulSet(instance, serviceLabels)
+	// Validate the CA cert secret if provided
+	if instance.Spec.KSMTLS.CaBundleSecretName != "" {
+		hash, ctrlResult, err := tls.ValidateCACertSecret(
+			ctx,
+			helper.GetClient(),
+			types.NamespacedName{
+				Name:      instance.Spec.KSMTLS.CaBundleSecretName,
+				Namespace: instance.Namespace,
+			},
+		)
+		if err != nil {
+			instance.KSMStatus.Conditions.Set(condition.FalseCondition(
+				condition.TLSInputReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.TLSInputErrorMessage,
+				err.Error()))
+			return ctrlResult, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			return ctrlResult, nil
+		}
+
+		if hash != "" {
+			(*configMapVars)[fmt.Sprintf("ksm-%s", tls.CABundleKey)] = env.SetValue(hash)
+		}
+	}
+
+	// Validate metadata service cert secret
+	if instance.Spec.KSMTLS.Enabled() {
+		hash, ctrlResult, err := instance.Spec.KSMTLS.ValidateCertSecret(ctx, helper, instance.Namespace)
+		if err != nil {
+			instance.KSMStatus.Conditions.Set(condition.FalseCondition(
+				condition.TLSInputReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.TLSInputErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			return ctrlResult, nil
+		}
+		(*configMapVars)[fmt.Sprintf("ksm-%s", tls.TLSHashName)] = env.SetValue(hash)
+	}
+
+	tlsConfName := ""
+	if instance.Spec.KSMTLS.Enabled() {
+		tlsConfDef := availability.KSMTLSConfig(instance, serviceLabels, availability.TLSCertPath, availability.TLSKeyPath)
+		tlsConfName = tlsConfDef.Name
+
+		hash, op, err := secret.CreateOrPatchSecret(ctx, helper, instance, tlsConfDef)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if op != controllerutil.OperationResultNone {
+			Log.Info(fmt.Sprintf("KSM TLS config %s successfully changed - operation: %s", tlsConfDef.Name, string(op)))
+		}
+		(*configMapVars)[tlsConfDef.Name] = env.SetValue(hash)
+	}
+
+	// create the service
+	ssDef, err := availability.KSMStatefulSet(instance, tlsConfName, serviceLabels)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	ss := statefulset.NewStatefulSet(ssDef, time.Duration(5)*time.Second)
 
+	ss := statefulset.NewStatefulSet(ssDef, time.Duration(5)*time.Second)
 	ctrlResult, err = ss.CreateOrPatch(ctx, helper)
 	if err != nil {
 		instance.KSMStatus.Conditions.Set(condition.FalseCondition(
@@ -920,14 +988,12 @@ func (r *CeilometerReconciler) createHashOfInputHashes(
 	envVars map[string]env.Setter,
 ) (string, bool, error) {
 	Log := r.GetLogger(ctx)
-	var hashMap map[string]string
 	changed := false
-	mergedMapVars := env.MergeEnvs([]corev1.EnvVar{}, envVars)
-	hash, err := util.ObjectHash(mergedMapVars)
+	hash, err := util.HashOfInputHashes(envVars)
 	if err != nil {
 		return hash, changed, err
 	}
-	if hashMap, changed = util.SetHash(instance.CeilometerStatus.Hash, common.InputHashName, hash); changed {
+	if hashMap, changed := util.SetHash(instance.CeilometerStatus.Hash, common.InputHashName, hash); changed {
 		instance.CeilometerStatus.Hash = hashMap
 		Log.Info(fmt.Sprintf("Input maps hash %s - %s", common.InputHashName, hash))
 	}
