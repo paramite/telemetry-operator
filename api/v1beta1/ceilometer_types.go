@@ -105,11 +105,6 @@ type CeilometerSpecCore struct {
 	// +operator-sdk:csv:customresourcedefinitions:type=spec
 	// TLS - Parameters related to the TLS
 	TLS tls.SimpleService `json:"tls,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	// +operator-sdk:csv:customresourcedefinitions:type=spec
-	// KSMTLS - Parameters related to the TLS for kube-state-metrics
-	KSMTLS tls.SimpleService `json:"tls,omitempty"`
 }
 
 // CeilometerStatus defines the observed state of Ceilometer
@@ -130,6 +125,18 @@ type CeilometerStatus struct {
 	Networks []string `json:"networks,omitempty"`
 }
 
+// KSMStatus defines the observed state of kube-state-metrics
+type KSMStatus struct {
+	// ReadyCount of ksm instances
+	ReadyCount int32 `json:"readyCount,omitempty"`
+
+	// Map of hashes to track e.g. job status
+	Hash map[string]string `json:"hash,omitempty"`
+
+	// Conditions
+	Conditions condition.Conditions `json:"conditions,omitempty" optional:"true"`
+}
+
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 
@@ -138,8 +145,9 @@ type Ceilometer struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   CeilometerSpec   `json:"spec,omitempty"`
-	Status CeilometerStatus `json:"status,omitempty"`
+	Spec             CeilometerSpec   `json:"spec,omitempty"`
+	CeilometerStatus CeilometerStatus `json:"status,omitempty"`
+	KSMStatus        KSMStatus        `json:"ksmStatus,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -153,7 +161,8 @@ type CeilometerList struct {
 
 // IsReady - returns true if Ceilometer is reconciled successfully
 func (instance Ceilometer) IsReady() bool {
-	return instance.Status.Conditions.IsTrue(condition.ReadyCondition)
+	return instance.CeilometerStatus.Conditions.IsTrue(condition.ReadyCondition) &&
+		instance.KSMStatus.Conditions.IsTrue(condition.ReadyCondition)
 }
 
 func init() {
@@ -162,7 +171,7 @@ func init() {
 
 // RbacConditionsSet - set the conditions for the rbac object
 func (instance Ceilometer) RbacConditionsSet(c *condition.Condition) {
-	instance.Status.Conditions.Set(c)
+	instance.CeilometerStatus.Conditions.Set(c)
 }
 
 // RbacNamespace - return the namespace
