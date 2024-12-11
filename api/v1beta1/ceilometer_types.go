@@ -123,34 +123,41 @@ type CeilometerSpecCore struct {
 	NodeSelector *map[string]string `json:"nodeSelector,omitempty"`
 }
 
-// CeilometerStatus defines the observed state of Ceilometer
-type CeilometerStatus struct {
-	// CeilometerReadyCount of ceilometer instances
-	CeilometerReadyCount int32 `json:"ceilometerReadyCount,omitempty"`
+type CeilometerStatusCore struct {
+	// ReadyCount of ksm instances
+	ReadyCount int32 `json:"readyCount,omitempty"`
 
-	// KSMReadyCount of KSM instances
-	KSMReadyCount int32 `json:"ksmReadyCount,omitempty"`
-
-	// Map of hashes to track (e.g. job status) for Ceilometer
-	CeilometerHash map[string]string `json:"ceilometerHash,omitempty"`
-
-	// Map of hashes to track (e.g. job status) for kube-state-metrics
-	KSMHash map[string]string `json:"ksmHash,omitempty"`
+	// Map of hashes to track e.g. job status
+	Hash map[string]string `json:"hash,omitempty"`
 
 	// Conditions
 	Conditions condition.Conditions `json:"conditions,omitempty" optional:"true"`
-
-	// TransportURLSecret - Secret containing RabbitMQ transportURL
-	TransportURLSecret string `json:"transportURLSecret,omitempty"`
-
-	// Networks in addtion to the cluster network, the service is attached to
-	Networks []string `json:"networks,omitempty"`
 
 	// ObservedGeneration - the most recent generation observed for this
 	// service. If the observed generation is less than the spec generation,
 	// then the controller has not processed the latest changes injected by
 	// the openstack-operator in the top-level CR (e.g. the ContainerImage)
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// InitCondition initializes conditions used later as Status=Unknown
+func (sc *CeilometerStatusCore) InitConditions(generation int64, cl condition.Conditions) {
+	sc.Conditions.Init(&cl)
+	sc.ObservedGeneration = generation
+	if sc.Hash == nil {
+		sc.Hash = map[string]string{}
+	}
+}
+
+// CeilometerStatus defines the observed state of Ceilometer
+type CeilometerStatus struct {
+	CeilometerStatusCore `json:",inline"`
+
+	// TransportURLSecret - Secret containing RabbitMQ transportURL
+	TransportURLSecret string `json:"transportURLSecret,omitempty"`
+
+	// Networks in addtion to the cluster network, the service is attached to
+	Networks []string `json:"networks,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -163,8 +170,9 @@ type Ceilometer struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   CeilometerSpec   `json:"spec,omitempty"`
-	Status CeilometerStatus `json:"status,omitempty"`
+	Spec             CeilometerSpec       `json:"spec,omitempty"`
+	CeilometerStatus CeilometerStatus     `json:"status,omitempty"`
+	KSMStatus        CeilometerStatusCore `json:"ksmStatus,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -178,8 +186,8 @@ type CeilometerList struct {
 
 // IsReady - returns true if Ceilometer is reconciled successfully
 func (instance Ceilometer) IsReady() bool {
-	return instance.Status.Conditions.IsTrue(CeilometerReadyCondition) &&
-		instance.Status.Conditions.IsTrue(KSMReadyCondition)
+	return instance.CeilometerStatus.Conditions.IsTrue(CeilometerReadyCondition) &&
+		instance.KSMStatus.Conditions.IsTrue(KSMReadyCondition)
 }
 
 func init() {
@@ -188,7 +196,7 @@ func init() {
 
 // RbacConditionsSet - set the conditions for the rbac object
 func (instance Ceilometer) RbacConditionsSet(c *condition.Condition) {
-	instance.Status.Conditions.Set(c)
+	instance.CeilometerStatus.Conditions.Set(c)
 }
 
 // RbacNamespace - return the namespace
