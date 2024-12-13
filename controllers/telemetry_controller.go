@@ -39,6 +39,15 @@ import (
 	utils "github.com/openstack-k8s-operators/telemetry-operator/pkg/utils"
 )
 
+type generationCheck struct {
+	Ceilometer bool
+	KSM        bool
+}
+
+func (gc generationCheck) AllOK() bool {
+	return gc.Ceilometer && gc.KSM
+}
+
 // TelemetryReconciler reconciles a Telemetry object
 type TelemetryReconciler struct {
 	client.Client
@@ -133,6 +142,7 @@ func (r *TelemetryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	cl := condition.CreateList(
 		condition.UnknownCondition(condition.ReadyCondition, condition.InitReason, condition.ReadyInitMessage),
 		condition.UnknownCondition(telemetryv1.CeilometerReadyCondition, condition.InitReason, telemetryv1.CeilometerReadyInitMessage),
+		condition.UnknownCondition(telemetryv1.KSMReadyCondition, condition.InitReason, telemetryv1.KSMReadyInitMessage),
 		condition.UnknownCondition(telemetryv1.AutoscalingReadyCondition, condition.InitReason, telemetryv1.AutoscalingReadyInitMessage),
 		condition.UnknownCondition(telemetryv1.MetricStorageReadyCondition, condition.InitReason, telemetryv1.MetricStorageReadyInitMessage),
 		condition.UnknownCondition(telemetryv1.LoggingReadyCondition, condition.InitReason, telemetryv1.LoggingReadyInitMessage),
@@ -273,6 +283,12 @@ func (r TelemetryReconciler) reconcileCeilometer(ctx context.Context, instance *
 			condition.SeverityWarning,
 			telemetryv1.CeilometerReadyErrorMessage,
 			err.Error()))
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			telemetryv1.KSMReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			telemetryv1.KSMReadyErrorMessage,
+			err.Error()))
 		return ctrl.Result{}, err
 	}
 
@@ -285,25 +301,42 @@ func (r TelemetryReconciler) reconcileCeilometer(ctx context.Context, instance *
 			condition.RequestedReason,
 			condition.SeverityInfo,
 			telemetryv1.CeilometerReadyRunningMessage))
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			telemetryv1.KSMReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			telemetryv1.KSMReadyRunningMessage))
 		return ctrl.Result{}, nil
 	}
 
-	if !ceilObsGen {
+	if !ceilObsGen.Ceilometer {
 		instance.Status.Conditions.Set(condition.UnknownCondition(
 			telemetryv1.CeilometerReadyCondition,
 			condition.InitReason,
 			telemetryv1.CeilometerReadyRunningMessage,
 		))
 	} else {
-
 		// Mirror Ceilometer's condition status
 		c := ceilometerInstance.CeilometerStatus.Conditions.Mirror(telemetryv1.CeilometerReadyCondition)
 		if c != nil {
 			instance.Status.Conditions.Set(c)
 		}
 	}
+	if !ceilObsGen.KSM {
+		instance.Status.Conditions.Set(condition.UnknownCondition(
+			telemetryv1.KSMReadyCondition,
+			condition.InitReason,
+			telemetryv1.KSMReadyRunningMessage,
+		))
+	} else {
+		// Mirror KSM's condition status
+		c := ceilometerInstance.KSMStatus.Conditions.Mirror(telemetryv1.KSMReadyCondition)
+		if c != nil {
+			instance.Status.Conditions.Set(c)
+		}
+	}
 
-	if op != controllerutil.OperationResultNone && ceilObsGen {
+	if op != controllerutil.OperationResultNone && ceilObsGen.AllOK() {
 		helper.GetLogger().Info(fmt.Sprintf("%s %s - %s", ceilometer.ServiceName, ceilometerInstance.Name, op))
 	}
 
@@ -554,25 +587,36 @@ func (r *TelemetryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // checkCeilometerGeneration -
 func (r *TelemetryReconciler) checkCeilometerGeneration(
 	instance *telemetryv1.Telemetry,
-) (bool, error) {
+) (generationCheck, error) {
+	check := generationCheck{
+		Ceilometer: true,
+		KSM:        true,
+	}
+
 	Log := r.GetLogger(context.Background())
 	clm := &telemetryv1.CeilometerList{}
 	listOpts := []client.ListOption{
 		client.InNamespace(instance.Namespace),
 	}
-	if err := r.Client.List(context.Background(), clm, listOpts...); err != nil {
+
+	err := r.Client.List(context.Background(), clm, listOpts...)
+	if err != nil {
 		Log.Error(err, "Unable to retrieve Ceilometer CR %w")
-		return false, err
-	}
-	for _, item := range clm.Items {
-		if item.Generation != item.CeilometerStatus.ObservedGeneration {
-			return false, nil
+		check.Ceilometer = false
+		check.KSM = false
+	} else {
+		for _, item := range clm.Items {
+			if item.Generation != item.CeilometerStatus.ObservedGeneration {
+				check.Ceilometer = false
+				break
+			}
+			if item.Generation != item.KSMStatus.ObservedGeneration {
+				check.KSM = false
+				break
+			}
 		}
-		if item.Generation != item.KSMStatus.ObservedGeneration {
-			return false, nil
-		}
 	}
-	return true, nil
+	return check, err
 }
 
 // checkAutoscalingGeneration -

@@ -571,8 +571,10 @@ func (r *MetricStorageReconciler) createScrapeConfigs(
 	ksmRoute := fmt.Sprintf("%s.%s.svc", availability.KSMServiceName, instance.Namespace)
 	ksmTarget := []string{fmt.Sprintf("%s:%d", ksmRoute, availability.KSMMetricsPort)}
 	ksmCfgName := fmt.Sprintf("%s-ksm", telemetry.ServiceName)
+	// TODO(mmagr): TLS is hardcoded to false until openstack-operator is able to create certs,
+	//              see https://github.com/openstack-k8s-operators/openstack-operator/pull/1056
 	err = r.createServiceScrapeConfig(ctx, instance, Log, "kube-state-metrics",
-		ksmCfgName, ksmTarget, instance.Spec.PrometheusTLS.Enabled())
+		ksmCfgName, ksmTarget, false)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

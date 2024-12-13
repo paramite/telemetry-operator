@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	//delve "runtime"
 	"sort"
 	"time"
 
@@ -80,6 +81,7 @@ func (r *CeilometerReconciler) GetLogger(ctx context.Context) logr.Logger {
 
 // +kubebuilder:rbac:groups=telemetry.openstack.org,resources=ceilometers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=telemetry.openstack.org,resources=ceilometers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=telemetry.openstack.org,resources=ceilometers/ksmstatus,verbs=get;update;patch
 // +kubebuilder:rbac:groups=telemetry.openstack.org,resources=ceilometers/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -114,7 +116,7 @@ func (r *CeilometerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	helper, err := helper.NewHelper(
+	hlpr, err := helper.NewHelper(
 		instance,
 		r.Client,
 		r.Kclient,
@@ -127,7 +129,7 @@ func (r *CeilometerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// initialize status if Conditions is nil, but do not reset if it already
 	// exists
-	isNewInstance := instance.CeilometerStatus.Conditions == nil || instance.KSMStatus.Conditions == nil
+	isNewInstance := instance.CeilometerStatus.Conditions == nil && instance.KSMStatus.Conditions == nil
 	if isNewInstance {
 		instance.CeilometerStatus.Conditions = condition.Conditions{}
 		instance.KSMStatus.Conditions = condition.Conditions{}
@@ -154,11 +156,35 @@ func (r *CeilometerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				instance.KSMStatus.Conditions.Mirror(condition.ReadyCondition))
 		}
 
-		err := helper.PatchInstance(ctx, instance)
+		//NOTE(mmagr): Patch ksmStatus manually since PatchInstance method is able to handle 'status' key only
+		//TODO(mmagr): Merge ksmStatus to status ∂as soon as API version will be increased
+		err = hlpr.PatchInstance(ctx, instance)
 		if err != nil {
 			_err = err
 			return
 		}
+
+		changes := hlpr.GetChanges()
+		patch := client.MergeFrom(hlpr.GetBeforeObject())
+
+		//pdata, _ := patch.Data(instance)
+		//Log.Info(fmt.Sprintf("%v\n", string(pdata)))
+		//delve.Breakpoint()
+
+		if changes["ksmStatus"] {
+			err = hlpr.GetClient().Patch(ctx, instance, patch)
+			if k8s_errors.IsConflict(err) {
+				Log.Info("KSMStatus update conflict")
+				_err = err
+				return
+			} else if err != nil && !k8s_errors.IsNotFound(err) {
+				Log.Error(err, "KSMStatus update failed")
+				_err = err
+				return
+			}
+		}
+
+		Log.Info("Ceilometer object patched")
 
 	}()
 
@@ -187,18 +213,21 @@ func (r *CeilometerReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		),
 	)
 
+	instance.CeilometerStatus.ObservedGeneration = instance.Generation
+	instance.KSMStatus.ObservedGeneration = instance.Generation
+
 	// If we're not deleting this and the service object doesn't have our finalizer, add it.
-	if instance.DeletionTimestamp.IsZero() && controllerutil.AddFinalizer(instance, helper.GetFinalizer()) || isNewInstance {
+	if instance.DeletionTimestamp.IsZero() && controllerutil.AddFinalizer(instance, hlpr.GetFinalizer()) || isNewInstance {
 		return ctrl.Result{}, nil
 	}
 
 	// Handle service delete
 	if !instance.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, instance, helper)
+		return r.reconcileDelete(ctx, instance, hlpr)
 	}
 
 	// Handle non-deleted clusters
-	return r.reconcileNormal(ctx, instance, helper)
+	return r.reconcileNormal(ctx, instance, hlpr)
 }
 
 // fields to index to reconcile when change
@@ -775,6 +804,10 @@ func (r *CeilometerReconciler) reconcileKSM(
 		}
 		if op == controllerutil.OperationResultCreated || op == controllerutil.OperationResultUpdated {
 			instance.KSMStatus.Conditions.MarkTrue(condition.CreateServiceReadyCondition, condition.CreateServiceReadyMessage)
+		}
+		if instance.KSMStatus.Conditions.AllSubConditionIsTrue() {
+			instance.KSMStatus.Conditions.MarkTrue(
+				condition.ReadyCondition, condition.ReadyMessage)
 		}
 		Log.Info(fmt.Sprintf(msgReconcileSuccess, availability.KSMServiceName))
 	}
